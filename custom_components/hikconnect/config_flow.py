@@ -100,6 +100,12 @@ class OptionsFlowHandler(config_entries.OptionsFlowWithReload):
                 vol.Required(
                     "call_status_mode", default=current_mode
                 ): vol.In(["callstate", "isapi"]),
+                vol.Optional(
+                    "verification_code",
+                    description={
+                        "suggested_value": self.config_entry.options.get("verification_code")
+                    },
+                ): str,
             }
         )
         return self.async_show_form(step_id="init", data_schema=options_schema)
