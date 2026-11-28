@@ -38,7 +38,7 @@ STREAM_QUEUE_SIZE = 100
 STREAM_LINGER = 3  # seconds
 # the browser stops sending when the talk button is released
 TALK_IDLE_TIMEOUT = 3  # seconds
-# go2rtc sends 128 ms packets, more queued means the talk lags behind
+# browser audio packets (20 ms each in issue #83), more queued means the talk lags behind
 TALK_QUEUE_SIZE = 10
 # don't hammer the cloud with a new session for every packet when talking fails
 TALK_RETRY_DELAY = 5  # seconds
@@ -125,6 +125,9 @@ class HikConnectCamera(Camera):
         self.parameter_sets: dict[int, bytes] = {}
         self._talk_queue: asyncio.Queue | None = None
         self._talk_retry_at = 0.0
+        self._talk_lagged = 0
+        # RTSP clients of the device audio, called with PCMU during a talk
+        self.audio_listeners: set = set()
         self._attr_supported_features = CameraEntityFeature.STREAM
         # support_talk 1 = full duplex; 3 = push to talk needs other commands, not implemented
         self.supports_talk = device_info.get("talk") == 1
@@ -255,11 +258,13 @@ class HikConnectCamera(Camera):
             if time.monotonic() < self._talk_retry_at:
                 return
             queue = self._talk_queue = asyncio.Queue(TALK_QUEUE_SIZE)
+            self._talk_lagged = 0
             self.hass.async_create_background_task(
                 self._talk(queue, codec), f"hikconnect talk {self.entity_id}"
             )
         if queue.full():
             _LOGGER.debug("Talk to %s lags behind, dropping audio", self.name)
+            self._talk_lagged += 1
         else:
             queue.put_nowait(audio)
 
@@ -267,6 +272,7 @@ class HikConnectCamera(Camera):
         _LOGGER.debug("Starting talk to %s, %s audio from the browser", self.name, codec)
         received = chunks = dropped = 0
         failed = True
+        device_audio = None
         try:
             async with self._api.talk(
                 self._device_info["serial"], self._camera_info["channel_number"]
@@ -283,12 +289,15 @@ class HikConnectCamera(Camera):
                     )
                     return
                 convert = g711.converter(codec, device_codec)
+                device_audio = self.hass.async_create_background_task(
+                    self._device_audio(session, g711.converter(device_codec, "PCMU")),
+                    f"hikconnect device audio {self.entity_id}",
+                )
                 # recorded while the session was starting, sending it would delay all the rest
                 while not queue.empty():
                     queue.get_nowait()
                     dropped += 1
-                loop = asyncio.get_running_loop()
-                buffer, due = b"", loop.time()
+                buffer = b""
                 while True:
                     try:
                         async with asyncio.timeout(TALK_IDLE_TIMEOUT):
@@ -299,30 +308,48 @@ class HikConnectCamera(Camera):
                         break
                     received += 1
                     buffer += convert(audio)
-                    due = max(due, loop.time())
                     while len(buffer) >= TALK_CHUNK:
                         async with asyncio.timeout(TALK_SEND_TIMEOUT):
                             await session.send(buffer[:TALK_CHUNK])
                         buffer = buffer[TALK_CHUNK:]
                         chunks += 1
-                        due += TALK_CHUNK_TIME
-                        await asyncio.sleep(due - loop.time())
+                        # spread a long packet over its real time, but send a backlog left by
+                        # network jitter at once or it would never shrink
+                        if len(buffer) >= TALK_CHUNK and queue.empty():
+                            await asyncio.sleep(TALK_CHUNK_TIME)
         except (HikConnectError, aiohttp.ClientError, OSError, TimeoutError) as exc:
             _LOGGER.warning("Talk to %s failed: %s", self.name, str(exc) or repr(exc))
         finally:
+            if device_audio:
+                device_audio.cancel()
             if self._talk_queue is queue:
                 self._talk_queue = None
             if failed:
                 self._talk_retry_at = time.monotonic() + TALK_RETRY_DELAY
             _LOGGER.debug(
-                "Talk to %s ended: %d packets from the browser (%d dropped at start), "
-                "%d sent to the device%s",
+                "Talk to %s ended: %d packets from the browser (%d dropped at start, "
+                "%d lagging behind), %d sent to the device%s",
                 self.name,
-                received + dropped,
+                received + dropped + self._talk_lagged,
                 dropped,
+                self._talk_lagged,
                 chunks,
                 f", next try in {TALK_RETRY_DELAY} s" if failed else "",
             )
+
+    async def _device_audio(self, session, convert) -> None:
+        """Pass the device audio of a talk session on to the RTSP clients."""
+        first = True
+        with contextlib.suppress(HikConnectError):  # the talk itself reports it
+            async for audio in session.received():
+                if first:
+                    _LOGGER.debug(
+                        "Device audio of %s comes in packets of %d bytes", self.name, len(audio)
+                    )
+                    first = False
+                audio = convert(audio)
+                for send in self.audio_listeners:
+                    send(audio)
 
     async def async_will_remove_from_hass(self) -> None:
         if self._producer:
